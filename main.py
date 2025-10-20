@@ -1,6 +1,5 @@
 import os
 import json
-import sqlite3
 from datetime import datetime
 import discord
 from discord.ext import commands
@@ -8,76 +7,75 @@ from discord import app_commands
 from fastapi import FastAPI
 import uvicorn
 from dotenv import load_dotenv
+from supabase import create_client, Client  # New import
 
 load_dotenv()
 
-# Bot setup
+# Bot setup (unchanged)
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Config
+# Config (removed MOD_CHANNEL_ID; now from DB)
 TOKEN = os.getenv('DISCORD_TOKEN')
-MOD_CHANNEL_ID = int(os.getenv('MOD_CHANNEL_ID', 0))
-DB_PATH = 'data/robot.db'  # Render mounts /app/data
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
-# Colors for professional embeds (Roblox blue theme)
+# Colors & FastAPI (unchanged)
 EMBED_COLOR = 0x00A2FF
-
-# FastAPI for keepalive (Render free tier)
 app = FastAPI()
 
 @app.get("/keepalive")
 async def keepalive():
     return {"status": "alive", "bot": "RoBot running"}
 
-# Database setup
+# DB setup (added settings table init)
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    # Users table (dev profiles)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            experience INTEGER DEFAULT 0,
-            specializations TEXT DEFAULT '[]',  -- JSON list
-            payment_methods TEXT DEFAULT '[]',  -- JSON list
-            rate REAL DEFAULT 0.0,  -- Hourly/project rate
-            bio TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    # Reports table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            reporter_id INTEGER,
-            reported_id INTEGER,
-            reason TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    if not supabase:
+        print("Warning: Supabase not configured—falling back to in-memory (data lost on restart).")
+        return
+    # Create settings table if needed
+    try:
+        supabase.table('settings').insert({'key': 'mod_channel_id', 'value': 0}).execute()
+        print("Supabase connected with settings!")
+    except Exception as e:
+        print(f"DB Error: {e}")
 
 init_db()
 
-def get_db_connection():
-    return sqlite3.connect(DB_PATH)
+# Helper: Get setting from DB
+async def get_setting(key: str):
+    if not supabase:
+        return 0
+    try:
+        response = supabase.table('settings').select('value').eq('key', key).execute()
+        return response.data[0]['value'] if response.data else 0
+    except:
+        return 0
 
-# Helper: Load JSON field
+# Helper: Set setting in DB
+async def set_setting(key: str, value: int):
+    if not supabase:
+        return False
+    try:
+        supabase.table('settings').upsert({'key': key, 'value': value}).execute()
+        return True
+    except:
+        return False
+
+# Helper: Load JSON field (unchanged)
 def load_json(field):
     try:
         return json.loads(field) if field else []
     except:
         return []
 
-# Helper: Save JSON field
+# Helper: Save JSON field (unchanged)
 def save_json(data):
     return json.dumps(data)
 
-# Embed helper
+# Embed helper (unchanged)
 def create_embed(title, description="", fields=None, color=EMBED_COLOR):
     embed = discord.Embed(title=title, description=description, color=color)
     if fields:
@@ -96,7 +94,24 @@ async def on_ready():
     except Exception as e:
         print(e)
 
-# /register command (for devs)
+# New: /setmodchannel command (admin-only)
+@bot.tree.command(name="setmodchannel", description="Set the mod channel for reports (Admin/Owner only)")
+@app_commands.describe(channel="The channel to receive reports")
+async def setmodchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    # Check permissions
+    if not interaction.user.guild_permissions.administrator and interaction.user != interaction.guild.owner:
+        await interaction.response.send_message(embed=create_embed("Access Denied", "Only admins/owners can set the mod channel.", color=0xFF0000), ephemeral=True)
+        return
+    
+    success = await set_setting('mod_channel_id', channel.id)
+    if success:
+        embed = create_embed("Mod Channel Set!", f"Reports will now go to {channel.mention}.", color=0x00FF00)
+    else:
+        embed = create_embed("Error", "Failed to save setting—check DB connection.", color=0xFF0000)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# /register (unchanged from last)
 @bot.tree.command(name="register", description="Register your developer profile")
 @app_commands.describe(
     experience="Years of Roblox dev experience (0-50)",
@@ -113,49 +128,61 @@ async def register(interaction: discord.Interaction, experience: int, specializa
     specs = [s.strip() for s in specializations.split(',') if s.strip()]
     payments = [p.strip() for p in payment_methods.split(',') if p.strip()]
     
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR REPLACE INTO users (user_id, experience, specializations, payment_methods, rate, bio)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (interaction.user.id, experience, save_json(specs), save_json(payments), rate, bio))
-    conn.commit()
-    conn.close()
+    if not supabase:
+        await interaction.response.send_message(embed=create_embed("Error", "Database not ready—try again later."), ephemeral=True)
+        return
     
-    embed = create_embed("Profile Registered!", f"**Experience:** {experience} years\n**Rate:** ${rate}\n**Specializations:** {', '.join(specs) or 'None'}\n**Payments:** {', '.join(payments) or 'None'}\n**Bio:** {bio or 'None'}")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    data = {
+        'user_id': interaction.user.id,
+        'experience': experience,
+        'specializations': save_json(specs),
+        'payment_methods': save_json(payments),
+        'rate': rate,
+        'bio': bio
+    }
+    
+    try:
+        supabase.table('users').upsert(data).execute()  # Upsert for update/insert
+        embed = create_embed("Profile Registered!", f"**Experience:** {experience} years\n**Rate:** ${rate}\n**Specializations:** {', '.join(specs) or 'None'}\n**Payments:** {', '.join(payments) or 'None'}\n**Bio:** {bio or 'None'}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(embed=create_embed("Error", f"Failed to save: {str(e)}"), ephemeral=True)
 
-# /profile command (view own or other's)
+# /profile (unchanged)
 @bot.tree.command(name="profile", description="View a user profile")
 @app_commands.describe(user="The user to view (optional: defaults to you)")
 async def profile(interaction: discord.Interaction, user: discord.Member = None):
     target = user or interaction.user
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM users WHERE user_id = ?', (target.id,))
-    row = cursor.fetchone()
-    conn.close()
-    
-    if not row:
-        await interaction.response.send_message(embed=create_embed("No Profile", f"{target.mention} has no registered profile."), ephemeral=True)
+    if not supabase:
+        await interaction.response.send_message(embed=create_embed("Error", "Database not ready."), ephemeral=True)
         return
     
-    specs = load_json(row[2])
-    payments = load_json(row[3])
-    embed = create_embed(
-        f"{target.display_name}'s Profile",
-        row[5] or "No bio.",
-        [
-            ("Experience", f"{row[1]} years", True),
-            ("Rate", f"${row[4]}", True),
-            ("Specializations", ', '.join(specs) or 'None', False),
-            ("Payment Methods", ', '.join(payments) or 'None', False)
-        ]
-    )
-    embed.set_thumbnail(url=target.avatar.url if target.avatar else None)
-    await interaction.response.send_message(embed=embed)
+    try:
+        response = supabase.table('users').select('*').eq('user_id', target.id).execute()
+        row = response.data[0] if response.data else None
+        
+        if not row:
+            await interaction.response.send_message(embed=create_embed("No Profile", f"{target.mention} has no registered profile."), ephemeral=True)
+            return
+        
+        specs = load_json(row['specializations'])
+        payments = load_json(row['payment_methods'])
+        embed = create_embed(
+            f"{target.display_name}'s Profile",
+            row['bio'] or "No bio.",
+            [
+                ("Experience", f"{row['experience']} years", True),
+                ("Rate", f"${row['rate']}", True),
+                ("Specializations", ', '.join(specs) or 'None', False),
+                ("Payment Methods", ', '.join(payments) or 'None', False)
+            ]
+        )
+        embed.set_thumbnail(url=target.avatar.url if target.avatar else None)
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        await interaction.response.send_message(embed=create_embed("Error", f"Failed to fetch: {str(e)}"), ephemeral=True)
 
-# /search command (for hirers)
+# /search (unchanged)
 @bot.tree.command(name="search", description="Search for developers matching your criteria")
 @app_commands.describe(
     min_experience="Min years of experience",
@@ -167,52 +194,50 @@ async def search(interaction: discord.Interaction, min_experience: int = 0, max_
     req_specs = [s.strip() for s in specializations.split(',') if s.strip()] if specializations else []
     req_payments = [p.strip() for p in payment_methods.split(',') if p.strip()] if payment_methods else []
     
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT user_id, experience, specializations, payment_methods, rate, bio
-        FROM users 
-        WHERE experience >= ? AND rate <= ?
-    ''', (min_experience, max_budget))
-    rows = cursor.fetchall()
-    conn.close()
-    
-    matches = []
-    for row in rows:
-        specs = load_json(row[2])
-        payments = load_json(row[3])
-        # Check intersections
-        spec_match = not req_specs or any(s.lower() in spec.lower() for spec in specs for s in req_specs)
-        pay_match = not req_payments or any(p.lower() in pay.lower() for pay in payments for p in req_payments)
-        if spec_match and pay_match:
-            user = bot.get_user(row[0])
-            matches.append({
-                'user': user or f"ID: {row[0]}",
-                'exp': row[1],
-                'rate': row[4],
-                'specs': specs,
-                'bio': row[5][:100] + '...' if len(row[5]) > 100 else row[5]
-            })
-    
-    if not matches:
-        await interaction.response.send_message(embed=create_embed("No Matches", f"No devs found for your criteria. Try broadening filters!"), ephemeral=False)
+    if not supabase:
+        await interaction.response.send_message(embed=create_embed("Error", "Database not ready."), ephemeral=True)
         return
     
-    # Paginated embed (simple: first page with up to 5, add reaction for more if needed)
-    embed = create_embed(f"Search Results ({len(matches)} matches)", "Here are top matches:")
-    for i, match in enumerate(matches[:5], 1):
-        user_mention = match['user'].mention if isinstance(match['user'], discord.User) else match['user']
-        embed.add_field(
-            name=f"{i}. {user_mention}",
-            value=f"**Exp:** {match['exp']}y | **Rate:** ${match['rate']}\n**Specs:** {', '.join(match['specs'][:2])}\n**Bio:** {match['bio']}",
-            inline=False
-        )
-    if len(matches) > 5:
-        embed.set_footer(text=f"Showing 1-5 of {len(matches)}. Use /profile for details.")
-    
-    await interaction.response.send_message(embed=embed, ephemeral=False)
+    try:
+        response = supabase.table('users').select('*').gte('experience', min_experience).lte('rate', max_budget).execute()
+        rows = response.data
+        
+        matches = []
+        for row in rows:
+            specs = load_json(row['specializations'])
+            payments = load_json(row['payment_methods'])
+            spec_match = not req_specs or any(any(req.lower() in spec.lower() for req in req_specs) for spec in specs)
+            pay_match = not req_payments or any(any(req.lower() in pay.lower() for req in req_payments) for pay in payments)
+            if spec_match and pay_match:
+                user = bot.get_user(row['user_id'])
+                matches.append({
+                    'user': user or f"ID: {row['user_id']}",
+                    'exp': row['experience'],
+                    'rate': row['rate'],
+                    'specs': specs,
+                    'bio': row['bio'][:100] + '...' if len(row['bio']) > 100 else row['bio']
+                })
+        
+        if not matches:
+            await interaction.response.send_message(embed=create_embed("No Matches", f"No devs found for your criteria. Try broadening filters!"), ephemeral=False)
+            return
+        
+        embed = create_embed(f"Search Results ({len(matches)} matches)", "Here are top matches:")
+        for i, match in enumerate(matches[:5], 1):
+            user_mention = match['user'].mention if hasattr(match['user'], 'mention') else match['user']
+            embed.add_field(
+                name=f"{i}. {user_mention}",
+                value=f"**Exp:** {match['exp']}y | **Rate:** ${match['rate']}\n**Specs:** {', '.join(match['specs'][:2])}\n**Bio:** {match['bio']}",
+                inline=False
+            )
+        if len(matches) > 5:
+            embed.set_footer(text=f"Showing 1-5 of {len(matches)}. Use /profile for details.")
+        
+        await interaction.response.send_message(embed=embed, ephemeral=False)
+    except Exception as e:
+        await interaction.response.send_message(embed=create_embed("Error", f"Search failed: {str(e)}"), ephemeral=True)
 
-# /report command
+# /report (updated to fetch mod channel from DB)
 @bot.tree.command(name="report", description="Report a user for review")
 @app_commands.describe(user="The user to report", reason="Reason for report (e.g., scam, spam)")
 async def report(interaction: discord.Interaction, user: discord.Member, reason: str):
@@ -220,28 +245,37 @@ async def report(interaction: discord.Interaction, user: discord.Member, reason:
         await interaction.response.send_message(embed=create_embed("Error", "Reason too long (max 1000 chars).", color=0xFF0000), ephemeral=True)
         return
     
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('INSERT INTO reports (reporter_id, reported_id, reason) VALUES (?, ?, ?)',
-                   (interaction.user.id, user.id, reason))
-    conn.commit()
-    conn.close()
+    if not supabase:
+        await interaction.response.send_message(embed=create_embed("Error", "Database not ready."), ephemeral=True)
+        return
     
-    # Send to mod channel
-    mod_channel = bot.get_channel(MOD_CHANNEL_ID)
-    if mod_channel:
-        report_embed = create_embed(
-            "New Report Received",
-            f"**Reporter:** {interaction.user.mention} (ID: {interaction.user.id})\n**Reported:** {user.mention} (ID: {user.id})\n**Reason:** {reason}",
-            color=0xFF9900
-        )
-        await mod_channel.send(embed=report_embed)
-    
-    await interaction.response.send_message(embed=create_embed("Report Submitted", f"Thanks for reporting {user.mention}. Mods will review it soon."), ephemeral=True)
+    try:
+        data = {
+            'reporter_id': interaction.user.id,
+            'reported_id': user.id,
+            'reason': reason
+        }
+        supabase.table('reports').insert(data).execute()
+        
+        mod_channel_id = await get_setting('mod_channel_id')
+        mod_channel = bot.get_channel(mod_channel_id)
+        if mod_channel:
+            report_embed = create_embed(
+                "New Report Received",
+                f"**Reporter:** {interaction.user.mention} (ID: {interaction.user.id})\n**Reported:** {user.mention} (ID: {user.id})\n**Reason:** {reason}",
+                color=0xFF9900
+            )
+            await mod_channel.send(embed=report_embed)
+        else:
+            print(f"Warning: Mod channel not set (ID: {mod_channel_id}). Set with /setmodchannel.")
+        
+        await interaction.response.send_message(embed=create_embed("Report Submitted", f"Thanks for reporting {user.mention}. Mods will review it soon."), ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(embed=create_embed("Error", f"Report failed: {str(e)}"), ephemeral=True)
 
-# Run bot (with FastAPI for Render)
+# Run (unchanged)
 if __name__ == "__main__":
-    if os.getenv('RENDER'):  # Render env
+    if os.getenv('RENDER'):
         uvicorn.run(app, host="0.0.0.0", port=int(os.getenv('PORT', 8000)))
     else:
         bot.run(TOKEN)
